@@ -1,0 +1,12 @@
+name: Build FFmpeg (arm64-v8a)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/ffmpeg-build-reusable.yml
+    with:
+      termux_arch: aarch64
+      android_abi: arm64-v8a
+    secrets: inherit

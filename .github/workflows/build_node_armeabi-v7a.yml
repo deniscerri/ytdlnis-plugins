@@ -1,0 +1,12 @@
+name: Build NodeJS (armeabi-v7a)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/node-build-reusable.yml
+    with:
+      termux_arch: arm
+      android_abi: armeabi-v7a
+    secrets: inherit

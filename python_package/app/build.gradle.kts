@@ -9,8 +9,8 @@ plugins {
 }
 
 val versionMajor = 3
-val versionMinor = 12
-val versionPatch = 11
+val versionMinor = 14
+val versionPatch = 6
 
 val abiCodes = mapOf(
     "armeabi-v7a" to 1,

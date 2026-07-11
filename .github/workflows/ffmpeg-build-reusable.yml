@@ -1,0 +1,174 @@
+name: Build FFmpeg package (reusable)
+
+# Reusable workflow: builds ffmpeg jniLibs for ONE architecture inside the termux
+# docker image, injects them into ffmpeg_package, and produces a signed per-ABI
+# APK artifact. Called by the four thin per-arch workflows.
+
+on:
+  workflow_call:
+    inputs:
+      termux_arch:
+        description: 'termux arch name (aarch64 | arm | i686 | x86_64)'
+        required: true
+        type: string
+      android_abi:
+        description: 'android ABI (arm64-v8a | armeabi-v7a | x86 | x86_64)'
+        required: true
+        type: string
+    secrets:
+      SIGNING_KEYSTORE_BASE64:
+        description: 'base64-encoded release keystore (.jks). If unset, a debug key is used.'
+        required: false
+      SIGNING_STORE_PASSWORD:
+        required: false
+      SIGNING_KEY_ALIAS:
+        required: false
+      SIGNING_KEY_PASSWORD:
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # ffmpeg pulls a large dependency tree; one arch still fits GitHub's 360 min cap.
+    timeout-minutes: 350
+    env:
+      # Pinned termux-packages commit -> reproducible tool versions
+      # (python 3.14.6, nodejs 26.4.0, deno 2.9.2, ffmpeg 8.1.2).
+      # Bump this SHA together with the app build.gradle versions to upgrade.
+      TERMUX_PACKAGES_REF: 8782a533d25ee3030d500a39305eb57b9d0e460b
+    steps:
+      # We overwrite all of this arch's jniLibs, so no need to pull the big LFS
+      # .so blobs (other arches' committed libs are irrelevant to our split APK).
+      - name: Checkout (no LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required Android SDK components
+        run: |
+          yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools" >/dev/null
+
+      - name: Clone termux-packages (pinned)
+        run: |
+          git init termux-packages
+          cd termux-packages
+          git remote add origin https://github.com/termux/termux-packages
+          git fetch --depth 1 origin "$TERMUX_PACKAGES_REF"
+          git checkout FETCH_HEAD
+
+      - name: Stage build script
+        run: |
+          cp scripts/build_ffmpeg.sh termux-packages/build_ffmpeg.sh
+          chmod +x termux-packages/build_ffmpeg.sh
+
+      - name: Build ffmpeg jniLibs for ${{ inputs.android_abi }}
+        working-directory: termux-packages
+        run: |
+          echo "Building ffmpeg for termux arch '${{ inputs.termux_arch }}' (ABI '${{ inputs.android_abi }}')"
+          ./scripts/run-docker.sh ./clean.sh || true
+          ./scripts/run-docker.sh ./build_ffmpeg.sh "${{ inputs.termux_arch }}"
+
+      - name: Verify jniLibs output
+        run: |
+          OUT="termux-packages/output/jniLibs/${{ inputs.android_abi }}"
+          echo "=== $OUT ==="
+          ls -lh "$OUT"
+          test -f "$OUT/libffmpeg.so"
+          test -f "$OUT/libffprobe.so"
+          test -f "$OUT/libffmpeg.zip.so"
+
+      - name: Inject jniLibs into ffmpeg_package
+        run: |
+          ABI="${{ inputs.android_abi }}"
+          SRC="termux-packages/output/jniLibs/$ABI"
+          DST="ffmpeg_package/app/src/main/jniLibs/$ABI"
+          mkdir -p "$DST"
+          cp -f "$SRC/libffmpeg.so"     "$DST/libffmpeg.so"
+          cp -f "$SRC/libffprobe.so"    "$DST/libffprobe.so"
+          cp -f "$SRC/libffmpeg.zip.so" "$DST/libffmpeg.zip.so"
+          echo "=== $DST ==="
+          ls -lh "$DST"
+
+      - name: Configure signing
+        working-directory: ffmpeg_package
+        env:
+          KS_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          KS_STORE_PW: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KS_KEY_PW: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "Using release keystore from secrets."
+            printf '%s' "$KS_B64" | base64 -d > "$PWD/keystore.jks"
+            {
+              echo "signingConfig.storeFile=$PWD/keystore.jks"
+              echo "signingConfig.storePassword=$KS_STORE_PW"
+              echo "signingConfig.keyAlias=$KS_ALIAS"
+              echo "signingConfig.keyPassword=$KS_KEY_PW"
+            } > keystore.properties
+          else
+            echo "No SIGNING_KEYSTORE_BASE64 secret set -> release will be signed with the default debug key."
+          fi
+
+      - name: Build APK
+        working-directory: ffmpeg_package
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Locate ${{ inputs.android_abi }} APK
+        id: apk
+        run: |
+          ABI="${{ inputs.android_abi }}"
+          DIR="ffmpeg_package/app/build/outputs/apk/release"
+          APK="$(find "$DIR" -name "app-${ABI}-release.apk" | head -1)"
+          if [ -z "$APK" ]; then
+            echo "APK for $ABI not found. Directory contents:"; ls -R "$DIR"; exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "Found APK: $APK"
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ inputs.android_abi }}-apk
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 90
+          compression-level: 0
+
+      - name: Upload raw jniLibs (bonus)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ inputs.android_abi }}-jnilibs
+          path: |
+            termux-packages/output/jniLibs/${{ inputs.android_abi }}/libffmpeg.so
+            termux-packages/output/jniLibs/${{ inputs.android_abi }}/libffprobe.so
+            termux-packages/output/jniLibs/${{ inputs.android_abi }}/libffmpeg.zip.so
+          retention-days: 90
+          compression-level: 0
+
+      - name: Summary
+        run: |
+          {
+            echo "## FFmpeg package built 🎬"
+            echo ""
+            echo "- **ABI:** \`${{ inputs.android_abi }}\`  (termux \`${{ inputs.termux_arch }}\`)"
+            echo "- **APK artifact:** \`ffmpeg-${{ inputs.android_abi }}-apk\`"
+            echo "- **jniLibs artifact:** \`ffmpeg-${{ inputs.android_abi }}-jnilibs\`"
+          } >> "$GITHUB_STEP_SUMMARY"

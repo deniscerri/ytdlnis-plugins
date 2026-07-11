@@ -1,0 +1,12 @@
+name: Build FFmpeg (x86)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/ffmpeg-build-reusable.yml
+    with:
+      termux_arch: i686
+      android_abi: x86
+    secrets: inherit

@@ -1,38 +1,39 @@
 #!/bin/bash
 #
-# Build deno (termux) for Android and pack it into the libdeno.so /
-# libdeno.zip.so JNI layout used by YTDLnis.
-#
-# NOTE: deno is 64-bit only, so only aarch64 (arm64-v8a) and x86_64 are built.
+# Build ffmpeg (termux, currently 8.1.x) for Android and pack it into the
+# libffmpeg.so / libffprobe.so / libffmpeg.zip.so JNI layout used by YTDLnis.
 #
 # RUN THIS FROM THE ROOT OF A termux-packages CHECKOUT, INSIDE the docker
-# container (start it with ./scripts/run-docker.sh, then run ./build-deno.sh).
+# container (start it with ./scripts/run-docker.sh, then run ./build_ffmpeg.sh).
 #
-# Output:  ./output/jniLibs/<android-abi>/{libdeno.so,libdeno.zip.so}
+# Output:  ./output/jniLibs/<android-abi>/{libffmpeg.so,libffprobe.so,libffmpeg.zip.so}
 #
-# Phase 2 unpacks EVERY runtime .deb the build staged (deno + its whole
-# dependency closure: libandroid-stub, libffi, libsqlite, zlib, ...), excluding
-# only "-static" dev packages -- so the bundle is self-contained.
+# Phase 3 unpacks EVERY runtime .deb the build staged (ffmpeg + its whole
+# dependency closure: libav*, fontconfig, freetype, harfbuzz, libxml2, libexpat,
+# libc++, ...), excluding only "-static" dev packages. That is what keeps the
+# bundle self-contained -- the missing-libexpat.so.1 class of failure cannot
+# happen when the entire closure is shipped.
 #
 set -euo pipefail
 shopt -s nullglob
 
 #
 # USAGE (termux arch names):
-#   ./build-deno.sh                      # both 64-bit arches
-#   ./build-deno.sh aarch64              # one arch (one CI job)
-#   SKIP_BUILD=1 ./build-deno.sh aarch64 # skip Phase 1, just re-pack existing .debs
+#   ./build_ffmpeg.sh                      # all four arches
+#   ./build_ffmpeg.sh aarch64              # one arch (one CI job)
+#   SKIP_BUILD=1 ./build_ffmpeg.sh aarch64 # skip Phase 1, just re-pack existing .debs
 #
 ############################  CONFIG  ############################
 
-ALL_ARCHES=("aarch64" "x86_64")   # deno has no 32-bit builds
+ALL_ARCHES=("aarch64" "arm" "i686" "x86_64")
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
-PKG="deno"           # termux package to build
-BIN_NAME="deno"      # produced executable at usr/bin/<BIN_NAME>
-LIB_PREFIX="libdeno" # -> libdeno.so (binary) + libdeno.zip.so (usr/ tree)
+# The termux package to build (pulls its whole dependency tree).
+FFMPEG_PKG="ffmpeg"
 
+# Name jniLibs folders with Android ABI names.
 USE_ANDROID_ABI_NAMES=true
+
 OUTPUT_BASE_DIR="${PWD}/output"
 JNI_DIR="${OUTPUT_BASE_DIR}/jniLibs"
 WORK="${OUTPUT_BASE_DIR}/_work"
@@ -69,26 +70,27 @@ mkdir -p "$WORK" "$JNI_DIR"
 if [ "$#" -gt 0 ]; then
     ARCHITECTURES=("$@")
     for a in "${ARCHITECTURES[@]}"; do
-        in_list "$a" "${ALL_ARCHES[@]}" || die "unknown/unsupported arch '$a' for deno (valid: ${ALL_ARCHES[*]})"
+        in_list "$a" "${ALL_ARCHES[@]}" || die "unknown arch '$a' (valid: ${ALL_ARCHES[*]})"
     done
 else
     ARCHITECTURES=("${ALL_ARCHES[@]}")
 fi
 log "Target arches: ${ARCHITECTURES[*]}   (SKIP_BUILD=${SKIP_BUILD})"
 
-########################  PHASE 1 - build per arch  ########################
+########################  PHASE 1 - build ffmpeg per arch  ########################
 if [ "$SKIP_BUILD" = "1" ]; then
     log "SKIP_BUILD=1 -> skipping Phase 1, reusing existing .debs in output/<arch>/"
 fi
 for ARCH in "${ARCHITECTURES[@]}"; do
     if [ "$SKIP_BUILD" = "1" ]; then continue; fi
-    log "Building $PKG for: $ARCH"
+    log "Building ffmpeg for: $ARCH"
     OUTPUT_DIR="${OUTPUT_BASE_DIR}/${ARCH}"
     mkdir -p "$OUTPUT_DIR"
 
-    ./build-package.sh -a "$ARCH" -o "$OUTPUT_DIR" "$PKG" \
+    ./build-package.sh -a "$ARCH" -o "$OUTPUT_DIR" "$FFMPEG_PKG" \
         || die "build failed for $ARCH"
 
+    # Defensive: pull in only THIS arch's (or "_all") debs that landed one dir up.
     find "${OUTPUT_BASE_DIR}" -maxdepth 1 -type f \
         \( -name "*_${ARCH}.deb" -o -name "*_all.deb" \) \
         -exec mv -t "$OUTPUT_DIR/" {} + 2>/dev/null || true
@@ -103,6 +105,7 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     rm -rf "$EX"; mkdir -p "$EX"
 
     # Unpack ALL of this arch's runtime .debs (+ "_all"), excluding "-static".
+    got_ffmpeg=false
     for deb in "${OUTPUT_BASE_DIR}/${ARCH}"/*_"${ARCH}".deb \
                "${OUTPUT_BASE_DIR}/${ARCH}"/*_all.deb; do
         base="$(basename "$deb")"
@@ -111,29 +114,42 @@ for ARCH in "${ARCHITECTURES[@]}"; do
         esac
         info "unpack $base"
         dpkg-deb -x "$deb" "$EX"
+        case "$base" in ffmpeg_*) got_ffmpeg=true ;; esac
     done
+    $got_ffmpeg || die "ffmpeg .deb not found for ${ARCH} (build incomplete)"
 
     FILES_DIR="${EX}/data/data/com.termux/files"
     USR="${FILES_DIR}/usr"
-    [ -f "${USR}/bin/${BIN_NAME}" ] || die "usr/bin/${BIN_NAME} not found for $ARCH (build incomplete)"
+    [ -d "$USR" ] || die "unexpected extraction layout for $ARCH"
+
+    # If fontconfig is present its libexpat dep MUST be too, else ffmpeg won't link.
+    if compgen -G "${USR}/lib/libfontconfig.so*" >/dev/null \
+       && ! compgen -G "${USR}/lib/libexpat.so*" >/dev/null; then
+        info "WARNING: libfontconfig present but libexpat missing -> ffmpeg will fail to link."
+    fi
+
+    [ -f "${USR}/bin/ffmpeg" ]  || die "usr/bin/ffmpeg not found for $ARCH"
+    [ -f "${USR}/bin/ffprobe" ] || die "usr/bin/ffprobe not found for $ARCH"
 
     if $USE_ANDROID_ABI_NAMES; then OUT_NAME="$(android_abi "$ARCH")"; else OUT_NAME="$ARCH"; fi
     dest="${JNI_DIR}/${OUT_NAME}"
     mkdir -p "$dest"
 
-    # The executable (run directly from jniLibs by the app).
-    cp "${USR}/bin/${BIN_NAME}" "${dest}/${LIB_PREFIX}.so"
+    # The two executables (run directly from jniLibs by the app).
+    cp "${USR}/bin/ffmpeg"  "${dest}/libffmpeg.so"
+    cp "${USR}/bin/ffprobe" "${dest}/libffprobe.so"
 
-    # The shared tree the binary dlopens: lib + etc + share.
-    # usr/bin is skipped to avoid duplicating the (large) binary copied above.
-    tmp_zip="${WORK}/${LIB_PREFIX}.zip"
+    # The shared tree both binaries dlopen: lib (libav*/deps), etc (fontconfig
+    # config), share (fontconfig/data). Skip usr/bin to avoid duplicating the
+    # ~50MB binaries we already copied out above.
+    tmp_zip="${WORK}/libffmpeg.zip"
     rm -f "$tmp_zip"
     zdirs=()
     for d in lib etc share; do [ -d "${USR}/${d}" ] && zdirs+=("usr/${d}"); done
     ( cd "$FILES_DIR" && zip --symlinks -qr "$tmp_zip" "${zdirs[@]}" )
-    mv "$tmp_zip" "${dest}/${LIB_PREFIX}.zip.so"
+    mv "$tmp_zip" "${dest}/libffmpeg.zip.so"
 
-    info "wrote ${dest}/{${LIB_PREFIX}.so,${LIB_PREFIX}.zip.so}"
+    info "wrote ${dest}/{libffmpeg.so,libffprobe.so,libffmpeg.zip.so}"
 done
 
 log "All done. JNI libraries are in: ${JNI_DIR}"

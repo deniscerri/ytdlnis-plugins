@@ -9,8 +9,8 @@ plugins {
 }
 
 val versionMajor = 2
-val versionMinor = 7
-val versionPatch = 7
+val versionMinor = 9
+val versionPatch = 2
 
 val abiCodes = mapOf(
     "arm64-v8a" to 2,

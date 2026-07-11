@@ -8,8 +8,8 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
-val versionMajor = 25
-val versionMinor = 3
+val versionMajor = 26
+val versionMinor = 4
 val versionPatch = 0
 
 val abiCodes = mapOf(

@@ -8,9 +8,9 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
-val versionMajor = 7
+val versionMajor = 8
 val versionMinor = 1
-val versionPatch = 1
+val versionPatch = 2
 
 val abiCodes = mapOf(
     "armeabi-v7a" to 1,
