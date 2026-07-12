@@ -182,6 +182,12 @@ check_prereqs
 ensure_cffi_recipe
 mkdir -p "$WORK" "$JNI_DIR"
 
+# Workaround: codeberg regenerated foot's 1.27.0 archive, drifting its sha256.
+# ncurses (a python dependency) fetches foot's tarball to build its terminfo, so
+# the stale checksum in x11-packages/foot/build.sh breaks the build. Correct it.
+# Self-clears (no-op) once the pinned termux-packages updates the value.
+sed -i 's/4e6131cc859ec6a36569f1978cf3617cc3836a681d13d228ded1b4885dab7770/9b9568ec5a9ff728f49c77d73644e7691fe386956e2d9acbdef0fc590e5828c8/' x11-packages/foot/build.sh 2>/dev/null || true
+
 # Select arches from the command line, defaulting to all of them.
 if [ "$#" -gt 0 ]; then
     ARCHITECTURES=("$@")

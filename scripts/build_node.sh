@@ -64,6 +64,12 @@ check_prereqs() {
 check_prereqs
 mkdir -p "$WORK" "$JNI_DIR"
 
+# Workaround: codeberg regenerated foot's 1.27.0 archive, drifting its sha256.
+# If ncurses is pulled into the tree it fetches foot's tarball for terminfo, so
+# the stale checksum in x11-packages/foot/build.sh breaks the build. Correct it.
+# Self-clears (no-op) once the pinned termux-packages updates the value.
+sed -i 's/4e6131cc859ec6a36569f1978cf3617cc3836a681d13d228ded1b4885dab7770/9b9568ec5a9ff728f49c77d73644e7691fe386956e2d9acbdef0fc590e5828c8/' x11-packages/foot/build.sh 2>/dev/null || true
+
 if [ "$#" -gt 0 ]; then
     ARCHITECTURES=("$@")
     for a in "${ARCHITECTURES[@]}"; do
