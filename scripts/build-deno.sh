@@ -3,34 +3,19 @@
 # Build deno (termux) for Android and pack it into the libdeno.so /
 # libdeno.zip.so JNI layout used by YTDLnis.
 #
-# NOTE: deno is 64-bit only, so only aarch64 (arm64-v8a) and x86_64 are built.
-#
-# RUN THIS FROM THE ROOT OF A termux-packages CHECKOUT, INSIDE the docker
-# container (start it with ./scripts/run-docker.sh, then run ./build-deno.sh).
-#
 # Output:  ./output/jniLibs/<android-abi>/{libdeno.so,libdeno.zip.so}
-#
-# Phase 2 unpacks EVERY runtime .deb the build staged (deno + its whole
-# dependency closure: libandroid-stub, libffi, libsqlite, zlib, ...), excluding
-# only "-static" dev packages -- so the bundle is self-contained.
 #
 set -euo pipefail
 shopt -s nullglob
 
-#
-# USAGE (termux arch names):
-#   ./build-deno.sh                      # both 64-bit arches
-#   ./build-deno.sh aarch64              # one arch (one CI job)
-#   SKIP_BUILD=1 ./build-deno.sh aarch64 # skip Phase 1, just re-pack existing .debs
-#
 ############################  CONFIG  ############################
 
-ALL_ARCHES=("aarch64" "x86_64")   # deno has no 32-bit builds
+ALL_ARCHES=("aarch64" "x86_64")
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
-PKG="deno"           # termux package to build
-BIN_NAME="deno"      # produced executable at usr/bin/<BIN_NAME>
-LIB_PREFIX="libdeno" # -> libdeno.so (binary) + libdeno.zip.so (usr/ tree)
+PKG="deno"
+BIN_NAME="deno"
+LIB_PREFIX="libdeno"
 
 USE_ANDROID_ABI_NAMES=true
 OUTPUT_BASE_DIR="${PWD}/output"
@@ -57,7 +42,7 @@ android_abi() {
 
 check_prereqs() {
     [ -x ./build-package.sh ] || die "build-package.sh not found. Run this from the termux-packages root."
-    for t in zip dpkg-deb; do
+    for t in zip dpkg-deb llvm-strip; do
         command -v "$t" >/dev/null 2>&1 || die "required tool '$t' not found on PATH."
     done
 }
@@ -66,10 +51,6 @@ check_prereqs() {
 check_prereqs
 mkdir -p "$WORK" "$JNI_DIR"
 
-# Workaround: codeberg regenerated foot's 1.27.0 archive, drifting its sha256.
-# If ncurses is pulled into the tree it fetches foot's tarball for terminfo, so
-# the stale checksum in x11-packages/foot/build.sh breaks the build. Correct it.
-# Self-clears (no-op) once the pinned termux-packages updates the value.
 sed -i 's/4e6131cc859ec6a36569f1978cf3617cc3836a681d13d228ded1b4885dab7770/9b9568ec5a9ff728f49c77d73644e7691fe386956e2d9acbdef0fc590e5828c8/' x11-packages/foot/build.sh 2>/dev/null || true
 
 if [ "$#" -gt 0 ]; then
@@ -102,18 +83,18 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     info "done: $ARCH"
 done
 
-########################  PHASE 2 - merge into JNI zip per arch  ########################
+########################  PHASE 2 - merge & optimize JNI zip  ########################
 for ARCH in "${ARCHITECTURES[@]}"; do
     log "Packaging JNI libs for: $ARCH"
     EX="${WORK}/extract-${ARCH}"
     rm -rf "$EX"; mkdir -p "$EX"
 
-    # Unpack ALL of this arch's runtime .debs (+ "_all"), excluding "-static".
+    # 1. Unpack non-static .deb packages
     for deb in "${OUTPUT_BASE_DIR}/${ARCH}"/*_"${ARCH}".deb \
                "${OUTPUT_BASE_DIR}/${ARCH}"/*_all.deb; do
         base="$(basename "$deb")"
         case "$base" in
-            *-static_*.deb) continue ;;
+            *-static_*.deb|*-dev_*.deb) continue ;;
         esac
         info "unpack $base"
         dpkg-deb -x "$deb" "$EX"
@@ -127,16 +108,38 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     dest="${JNI_DIR}/${OUT_NAME}"
     mkdir -p "$dest"
 
-    # The executable (run directly from jniLibs by the app).
+    # 2. Aggressive Cleanup of Non-Essential Files
+    info "Pruning unnecessary files and assets..."
+    rm -rf "${USR}/share/doc" \
+           "${USR}/share/man" \
+           "${USR}/share/info" \
+           "${USR}/share/locale" \
+           "${USR}/share/gtk-doc" \
+           "${USR}/include" \
+           "${USR}/lib/pkgconfig" \
+           "${USR}/lib/cmake"
+           
+    # Remove all development archives (.a files) accidentally packed in non-static packages
+    find "${USR}" -type f -name "*.a" -delete
+
+    # 3. Strip Symbols from Binaries and Dynamic Libraries (.so files)
+    info "Stripping symbols from executable and shared objects..."
+    llvm-strip --strip-unneeded "${USR}/bin/${BIN_NAME}" 2>/dev/null || strip --strip-unneeded "${USR}/bin/${BIN_NAME}" 2>/dev/null || true
+    
+    find "${USR}/lib" -type f -name "*.so*" -exec \
+        sh -c 'llvm-strip --strip-unneeded "$1" 2>/dev/null || strip --strip-unneeded "$1" 2>/dev/null || true' _ {} \;
+
+    # 4. Copy stripped executable to target
     cp "${USR}/bin/${BIN_NAME}" "${dest}/${LIB_PREFIX}.so"
 
-    # The shared tree the binary dlopens: lib + etc + share.
-    # usr/bin is skipped to avoid duplicating the (large) binary copied above.
+    # 5. Pack into maximum-compression ZIP archive
     tmp_zip="${WORK}/${LIB_PREFIX}.zip"
     rm -f "$tmp_zip"
     zdirs=()
     for d in lib etc share; do [ -d "${USR}/${d}" ] && zdirs+=("usr/${d}"); done
-    ( cd "$FILES_DIR" && zip --symlinks -qr "$tmp_zip" "${zdirs[@]}" )
+
+    info "Compressing runtime environment with maximum zip compression (-9)..."
+    ( cd "$FILES_DIR" && zip -9 --symlinks -qr "$tmp_zip" "${zdirs[@]}" )
     mv "$tmp_zip" "${dest}/${LIB_PREFIX}.zip.so"
 
     info "wrote ${dest}/{${LIB_PREFIX}.so,${LIB_PREFIX}.zip.so}"
